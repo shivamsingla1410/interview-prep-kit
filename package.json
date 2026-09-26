@@ -1,0 +1,12 @@
+{
+  "name": "trao-interview-prep",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm run dev --workspace @trao/api\" \"npm run dev --workspace @trao/web\"",
+    "build": "npm run build --workspace @trao/api && npm run build --workspace @trao/web",
+    "test": "npm run test --workspace @trao/api",
+    "evaluate": "npm run evaluate --workspace @trao/api --"
+  },
+  "devDependencies": { "concurrently": "^9.1.2", "typescript": "^5.7.3" }
+}
