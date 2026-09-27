@@ -1,6 +1,4 @@
-import type { NextConfig } from 'next';
-
-const nextConfig: NextConfig = {
+const nextConfig = {
   async rewrites() {
     const configuredTarget = process.env.API_PROXY_TARGET?.trim();
     if (!configuredTarget) return [];
