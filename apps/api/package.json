@@ -2,7 +2,7 @@
   "name": "@trao/api",
   "version": "1.0.0",
   "private": true,
-  "scripts": { "dev": "tsx watch src/server.ts", "build": "tsc -p tsconfig.json", "test": "tsx --test src/**/*.test.ts", "evaluate": "tsx src/evaluate.ts" },
+  "scripts": { "dev": "tsx watch src/server.ts", "build": "tsc -p tsconfig.json", "start": "node dist/server.js", "test": "tsx --test src/**/*.test.ts", "evaluate": "tsx src/evaluate.ts" },
   "dependencies": {
     "bcryptjs": "^2.4.3", "connect-mongo": "^5.1.0", "cors": "^2.8.5", "dotenv": "^16.4.7", "express": "^4.21.2", "express-rate-limit": "^7.5.0", "express-session": "^1.18.1", "mongoose": "^8.9.5", "zod": "^3.24.1"
   },

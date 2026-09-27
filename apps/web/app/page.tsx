@@ -8,7 +8,31 @@ const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api';
 type User = { id: string; fullName: string; email: string };
 type Kit = { _id: string; title: string; companyUrl: string; jobDescription?: string; daysAvailable: number; status: string; generationProgress?: string; generationError?: string; sourceGaps?: Array<{ source: string; reason: string }>; generatedKit?: any; practiceProgress?: Record<string, { confidence: 'low' | 'medium' | 'high'; attempts: number; firstPracticedAt?: string; lastPracticedAt?: string }>; regeneration?: { status?: string; section?: string; category?: string; progress?: string; error?: string }; createdAt: string };
 type PreparationFields = { title: string; companyUrl: string; daysAvailable: string; jobDescription: string };
+type ImportedCase = { title: string; companyUrl: string; jobDescription: string; daysAvailable?: number };
 const emptyPreparation: PreparationFields = { title: '', companyUrl: '', daysAvailable: '5', jobDescription: '' };
+
+function parseImportedCases(value: unknown): ImportedCase[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error('The workbook must contain at least one role.');
+  if (value.length > 10) throw new Error('Upload up to 10 roles at a time.');
+  return value.map((entry, index) => {
+    const row = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+    const jd = typeof row['Job description'] === 'string' ? row['Job description'].trim() : '';
+    const companyUrl = typeof row['Company website'] === 'string' ? row['Company website'].trim() : '';
+    const titleInput = typeof row['Role title'] === 'string' ? row['Role title'].trim() : '';
+    const title = (titleInput || jd.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '').slice(0, 120);
+    const daysValue = row['Days until interview (optional)'];
+    const daysAvailable = daysValue === undefined ? undefined : Number(daysValue);
+    const prefix = `Role ${index + 1}`;
+    if (jd.length < 20 || jd.length > 30_000) throw new Error(`${prefix}: job description must contain 20 to 30,000 characters.`);
+    if (title.length < 2) throw new Error(`${prefix}: role title must contain at least 2 characters.`);
+    try {
+      const url = new URL(companyUrl);
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+    } catch { throw new Error(`${prefix}: company website must be a valid HTTP or HTTPS URL.`); }
+    if (daysValue !== undefined && String(daysValue).trim() !== '' && (!Number.isInteger(daysAvailable) || daysAvailable! < 1 || daysAvailable! > 60)) throw new Error(`${prefix}: days until interview must be a whole number from 1 to 60.`);
+    return { title, companyUrl, jobDescription: jd, ...(daysValue !== undefined && String(daysValue).trim() !== '' && daysAvailable !== undefined ? { daysAvailable } : {}) };
+  });
+}
 
 async function request(path: string, init?: RequestInit) {
   let response: Response;
@@ -36,6 +60,12 @@ export default function Home() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [preparationFields, setPreparationFields] = useState<PreparationFields>(emptyPreparation);
+  const [importedCases, setImportedCases] = useState<ImportedCase[]>([]);
+  const [batchFileName, setBatchFileName] = useState('');
+  const [batchDefaultDays, setBatchDefaultDays] = useState('5');
+  const [batchError, setBatchError] = useState('');
+  const [batchNotice, setBatchNotice] = useState('');
+  const [batchSubmitting, setBatchSubmitting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -116,6 +146,51 @@ export default function Home() {
     } catch (e: any) { setError(e.message); setBusy(false); }
   }
 
+  async function selectBatchFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    setImportedCases([]); setBatchFileName(''); setBatchError(''); setBatchNotice('');
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) { setBatchError('Choose an Excel workbook (.xlsx).'); return; }
+    if (file.size > 5_000_000) { setBatchError('Choose an Excel workbook smaller than 5 MB.'); return; }
+    try {
+      const XLSX = await import('xlsx');
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      if (!firstSheet) throw new Error('The workbook does not contain a worksheet.');
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '', raw: false })
+        .filter((row) => Object.values(row).some((value) => String(value).trim() !== ''));
+      if (rows.length && !['Role title', 'Company website', 'Job description'].every((header) => header in rows[0])) {
+        throw new Error('Use the template columns: Role title, Company website, Job description, and optional Days until interview (optional).');
+      }
+      const parsed = parseImportedCases(rows);
+      setImportedCases(parsed);
+      setBatchFileName(file.name);
+    } catch (reason) {
+      setBatchError(reason instanceof Error ? reason.message : 'Could not read this Excel workbook.');
+    }
+  }
+
+  async function createBatch() {
+    const defaultDays = Number(batchDefaultDays);
+    if (!importedCases.length) { setBatchError('Choose a valid Excel workbook first.'); return; }
+    if (!Number.isInteger(defaultDays) || defaultDays < 1 || defaultDays > 60) { setBatchError('Default days must be a whole number from 1 to 60.'); return; }
+    setBatchSubmitting(true); setBatchError(''); setBatchNotice('');
+    const results = await Promise.allSettled(importedCases.map(async (item) => {
+      const response = await request('/kits', { method: 'POST', body: JSON.stringify({ ...item, daysAvailable: item.daysAvailable ?? defaultDays }) });
+      if (!response.kit?.id) throw new Error('API did not return a preparation ID.');
+      return { title: item.title, id: response.kit.id as string };
+    }));
+    const created = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+    const failures = results.flatMap((result, index) => result.status === 'rejected' ? [`${importedCases[index].title}: ${result.reason instanceof Error ? result.reason.message : 'Could not create this kit.'}`] : []);
+    await load();
+    if (created.length) void openKit(created[created.length - 1].id);
+    setBatchNotice(`${created.length} of ${importedCases.length} preparation(s) queued. Follow each kit's progress in history.`);
+    if (failures.length) setBatchError(failures.join(' '));
+    setBatchSubmitting(false);
+  }
+
   async function openKit(kitId: string) {
     setActiveKitId(kitId); setError(''); setNotice(''); router.push(`/prepare/${kitId}`);
     try {
@@ -157,7 +232,7 @@ export default function Home() {
   return <><main className="min-h-screen md:flex">
     <aside className="flex w-full flex-col border-r border-[var(--line)] bg-white md:fixed md:inset-y-0 md:w-[272px]">
       <div className="flex items-center gap-3 px-6 py-7"><div className="grid size-9 place-items-center rounded-xl bg-[var(--deep)] text-sm font-bold text-white">t.</div><span className="text-[19px] font-semibold tracking-tight">trao</span></div>
-      <div className="px-4"><button type="button" onClick={startNewPreparation} disabled={busy} className="flex w-full items-center gap-3 rounded-lg bg-[var(--deep)] px-4 py-3 text-left text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"><span className="text-lg">＋</span> New preparation</button></div>
+      <div className="px-4"><button type="button" onClick={startNewPreparation} disabled={busy || batchSubmitting} className="flex w-full items-center gap-3 rounded-lg bg-[var(--deep)] px-4 py-3 text-left text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"><span className="text-lg">＋</span> New preparation</button></div>
       <div className="mt-8 flex min-h-0 flex-1 flex-col px-4"><p className="shrink-0 px-3 text-[10px] font-semibold uppercase tracking-[.16em] text-stone-400">Your history</p>
         <div className="sidebar-history-scroll mt-3 min-h-0 flex-1 overflow-y-auto overscroll-y-contain scroll-smooth pr-1">{kits.length ? <div className="space-y-1">{kits.map((kit) => <button key={kit._id} onClick={() => void openKit(kit._id)} className={`w-full truncate rounded-lg px-3 py-2.5 text-left text-sm ${activeKitId === kit._id ? 'bg-[#f0f5f1] text-[var(--deep)]' : 'text-stone-600 hover:bg-stone-50'}`}><span className="mr-2 text-stone-300">{kit.status === 'generating' ? '◌' : kit.status === 'ready' ? '✓' : kit.status === 'failed' ? '!' : '◷'}</span>{kit.title}<span className="mt-1 block truncate pl-6 text-[11px] text-stone-400">{kit.status === 'generating' ? kit.generationProgress || 'Starting…' : kit.status === 'ready' ? 'Ready' : kit.status === 'failed' ? 'Needs attention' : 'Draft'}</span></button>)}</div> : <p className="px-3 py-3 text-xs leading-5 text-stone-400">Your saved preparations will appear here.</p>}</div>
       </div>
@@ -172,8 +247,17 @@ export default function Home() {
           <label className="mb-2 block text-sm font-medium">Days until your interview</label><input name="daysAvailable" value={preparationFields.daysAvailable} onChange={(event) => setPreparationFields({ ...preparationFields, daysAvailable: event.target.value })} required type="number" min={1} max={60} step={1} className="mb-5 w-full rounded-lg border border-[var(--line)] px-4 py-3 text-sm outline-none transition focus:border-[var(--green)] focus:ring-2 focus:ring-green-100" />
           <div className="mb-2 flex items-center justify-between"><label className="text-sm font-medium">Job description</label><span className="text-xs text-stone-400">Paste the full description</span></div><textarea name="jobDescription" value={preparationFields.jobDescription} onChange={(event) => setPreparationFields({ ...preparationFields, jobDescription: event.target.value })} required minLength={20} maxLength={30000} rows={8} placeholder="Paste the job description here…" className="w-full resize-y rounded-lg border border-[var(--line)] px-4 py-3 text-sm leading-6 outline-none transition placeholder:text-stone-300 focus:border-[var(--green)] focus:ring-2 focus:ring-green-100" />
           {error && <p role="alert" className="mt-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}{notice && <p role="status" className="mt-4 rounded-lg bg-green-50 px-4 py-3 text-sm text-green-800">{notice}</p>}
-          <div className="mt-6 flex flex-col items-start justify-between gap-4 border-t border-[var(--line)] pt-5 sm:flex-row sm:items-center"><p className="text-xs text-stone-400">Your draft is private to your account.</p><button type="submit" disabled={busy} className="w-full rounded-lg bg-[var(--deep)] px-5 py-3 text-sm font-medium text-white transition hover:bg-[#205548] disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto">{busy ? activeKit?.generationProgress || 'Preparing kit…' : 'Prepare kit'} <span className="ml-2">→</span></button></div>
+          <div className="mt-6 flex flex-col items-start justify-between gap-4 border-t border-[var(--line)] pt-5 sm:flex-row sm:items-center"><p className="text-xs text-stone-400">Your draft is private to your account.</p><button type="submit" disabled={busy || batchSubmitting} className="w-full rounded-lg bg-[var(--deep)] px-5 py-3 text-sm font-medium text-white transition hover:bg-[#205548] disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto">{busy ? activeKit?.generationProgress || 'Preparing kit…' : 'Prepare kit'} <span className="ml-2">→</span></button></div>
         </form>
+        <section className="mt-5 rounded-2xl border border-[var(--line)] bg-white p-5 shadow-[0_8px_30px_rgba(34,52,43,.035)] md:p-8" aria-labelledby="batch-heading">
+          <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 id="batch-heading" className="text-lg font-semibold">Prepare multiple roles</h2><p className="mt-1 text-sm text-stone-500">Fill in one role per row in the Excel template. Each role becomes a separate private kit.</p></div><a href="/batch-template.xlsx" download className="rounded-lg border border-[var(--line)] px-3 py-2 text-xs font-medium text-stone-600 transition hover:bg-stone-50">Download Excel template</a></div>
+          <label className="mt-5 block text-sm font-medium" htmlFor="batch-file">Excel workbook (.xlsx)</label><input id="batch-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => void selectBatchFile(event)} disabled={batchSubmitting} className="mt-2 block w-full text-sm text-stone-600 file:mr-3 file:rounded-lg file:border-0 file:bg-[#f0f5f1] file:px-3 file:py-2 file:text-xs file:font-medium file:text-[var(--green)]"/>
+          <div className="mt-4 flex flex-wrap items-end gap-3"><div><label htmlFor="batch-default-days" className="block text-xs font-medium text-stone-500">Default days (when a case omits days)</label><input id="batch-default-days" type="number" min={1} max={60} step={1} value={batchDefaultDays} onChange={(event) => setBatchDefaultDays(event.target.value)} disabled={batchSubmitting} className="mt-1 w-32 rounded-lg border border-[var(--line)] px-3 py-2 text-sm"/></div><button type="button" onClick={() => void createBatch()} disabled={!importedCases.length || batchSubmitting || busy} className="rounded-lg bg-[var(--deep)] px-4 py-2.5 text-sm font-medium text-white transition hover:bg-[#205548] disabled:cursor-not-allowed disabled:opacity-50">{batchSubmitting ? `Queueing ${importedCases.length} roles…` : `Prepare ${importedCases.length || ''} uploaded role${importedCases.length === 1 ? '' : 's'}`}</button></div>
+          {batchFileName && <p className="mt-3 text-xs text-stone-500">{batchFileName}: {importedCases.length} role(s) ready</p>}
+          {!!importedCases.length && <ul className="mt-3 divide-y divide-[var(--line)] rounded-lg border border-[var(--line)]">{importedCases.map((item, index) => <li key={`${item.title}-${index}`} className="flex flex-wrap justify-between gap-2 px-3 py-2.5 text-sm"><span className="font-medium">{item.title}</span><span className="text-xs text-stone-500">{new URL(item.companyUrl).hostname} · {item.daysAvailable ?? batchDefaultDays} day(s)</span></li>)}</ul>}
+          {batchError && <p role="alert" className="mt-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">{batchError}</p>}{batchNotice && <p role="status" className="mt-4 rounded-lg bg-green-50 px-4 py-3 text-sm text-green-800">{batchNotice}</p>}
+          <p className="mt-4 text-xs leading-5 text-stone-400">Use the first worksheet with the template headers. Add one role per row; job descriptions can span multiple lines inside a cell. Role title, company website, and job description are required. Days are optional and default to the value above. Up to 10 roles per workbook; file limit 5 MB.</p>
+        </section>
         {activeKit && <KitEditor kit={activeKit}
           onQuestionOperation={(operation) => updateKitContent('/questions', operation)}
           onFlashcardOperation={(operation) => updateKitContent('/flashcards', operation)}

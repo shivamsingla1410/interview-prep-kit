@@ -1,5 +1,7 @@
 import type { KitDocument, Question, Requirement, Research, SourceGap } from './types.js';
 import { kitSchema } from './types.js';
+import { findUncoveredRequirements } from './coverage.js';
+import { allocateSchedule } from './schedule.js';
 import { researchCompany, searchDiscussion } from './research.js';
 import { groqRateGate, providerRetryDelayMs } from './groq-rate-limit.js';
 import { randomUUID } from 'node:crypto';
@@ -114,14 +116,6 @@ function normalizeQuestions(raw: unknown, requirements: Requirement[], category:
   });
 }
 
-function allocateSchedule(questions: Question[], requirements: Requirement[], days: number) {
-  const mustIds = new Set(requirements.filter((r) => r.priority === 'must').map((r) => r.id));
-  const sorted = [...questions].sort((a, b) => Number(b.requirement_ids.some((id) => mustIds.has(id))) - Number(a.requirement_ids.some((id) => mustIds.has(id))) || b.difficulty - a.difficulty || a.id.localeCompare(b.id));
-  const bins = Array.from({ length: days }, () => [] as Question[]);
-  sorted.forEach((question, index) => bins[index % days].push(question));
-  return { days_available: days, days: bins.map((items, index) => ({ day: index + 1, focus: items.length ? [...new Set(items.map((item) => item.category.replace('-', ' ')))].join(' + ') : index === days - 1 ? 'Review and confidence check' : 'Review core requirements', question_ids: items.map((item) => item.id), minutes: Math.max(30, items.reduce((sum, item) => sum + 20 + item.difficulty * 10, 0)) })) };
-}
-
 export async function generateKit(input: { title: string; companyUrl: string; jobDescription: string; daysAvailable: number }, onProgress: (message: string) => void = () => undefined): Promise<{ kit: KitDocument; sourceGaps: SourceGap[] }> {
   if (!process.env.GROQ_API_KEY) throw Object.assign(new Error('Generation is not configured yet. Add GROQ_API_KEY to the API environment and try again.'), { code: 'MODEL_NOT_CONFIGURED' });
   onProgress('Researching company website and public sources');
@@ -158,7 +152,7 @@ export async function generateKit(input: { title: string; companyUrl: string; jo
     }
   }
 
-  let missing = role.requirements.filter((r) => !questions.some((q) => q.requirement_ids.includes(r.id)));
+  let missing = findUncoveredRequirements(role.requirements, questions);
   if (missing.length) {
     onProgress(`Coverage pass 2: repairing ${missing.length} uncovered requirements`);
     const batches = Array.from({ length: Math.ceil(missing.length / 4) }, (_, i) => missing.slice(i * 4, i * 4 + 4));
@@ -171,7 +165,7 @@ export async function generateKit(input: { title: string; companyUrl: string; jo
       normalized.forEach((q) => { const category = categoryByPrompt.get(q.prompt); if (['technical', 'behavioural', 'system-design', 'company-fit'].includes(String(category))) q.category = category as Question['category']; });
       questions.push(...normalized);
     }
-    missing = role.requirements.filter((r) => !questions.some((q) => q.requirement_ids.includes(r.id)));
+    missing = findUncoveredRequirements(role.requirements, questions);
   }
   // Deterministic fallback closes any remaining must-have coverage without another unbounded model loop.
   for (const requirement of missing.filter((r) => r.priority === 'must')) questions.push({ id: `q${questions.length + 1}`, requirement_ids: [requirement.id], category: requirement.kind === 'behavioural' ? 'behavioural' : requirement.kind === 'domain' ? 'company-fit' : 'technical', prompt: `Describe how you would demonstrate: ${requirement.text}`, answer_outline: `Use a specific example that directly addresses ${requirement.text}. Explain your approach, trade-offs, and measurable result.`, difficulty: 2, origin: 'generated', edited: false, pinned: false });
@@ -180,7 +174,7 @@ export async function generateKit(input: { title: string; companyUrl: string; jo
   const flashcards = role.requirements.slice(0, 30).map((r, i) => ({ id: `f${i + 1}`, front: `What should you be ready to discuss about ${r.text}?`, back: questions.find((q) => q.requirement_ids.includes(r.id))?.answer_outline || `Prepare one concrete example related to ${r.text}.`, requirement_ids: [r.id] }));
   questions = questions.map((q, i) => ({ ...q, id: `q${i + 1}` }));
   const schedule = allocateSchedule(questions, role.requirements, input.daysAvailable);
-  const coverage = { uncovered_requirement_ids: role.requirements.filter((r) => !questions.some((q) => q.requirement_ids.includes(r.id))).map((r) => r.id), passes: 2 };
+  const coverage = { uncovered_requirement_ids: findUncoveredRequirements(role.requirements, questions).map((requirement) => requirement.id), passes: 2 };
   const draft = {
     source: { company: research.companyName, company_url: input.companyUrl, role: role.title, location: role.location, jd_chars: input.jobDescription.length, researched_at: new Date().toISOString(), pages_used: [...research.pagesUsed, ...discussion.pages.map((p) => p.url)] },
     company_brief: { ...company, sources: [...research.pagesUsed, ...discussion.pages.map((p) => p.url)] },
@@ -273,7 +267,7 @@ export async function regenerateKitSection(input: {
     }, object, 1800, questionSchema, onProgress);
     questions.push(...normalizeQuestions(payload, batch, category, questions.length));
   }
-  const missing = requirements.filter((requirement) => !questions.some((question) => question.requirement_ids.includes(requirement.id)));
+  const missing = findUncoveredRequirements(requirements, questions);
   for (const requirement of missing) questions.push({ id: `q${questions.length + 1}`, requirement_ids: [requirement.id], category, prompt: `Describe how you would demonstrate: ${requirement.text}`, answer_outline: `Use a specific example that directly addresses ${requirement.text}. Explain your approach, trade-offs, and measurable result.`, difficulty: 2, origin: 'generated', edited: false, pinned: false });
   return { section: 'questions', category, questions: questions.map((question) => ({ ...question, id: `q-${randomUUID()}` })) };
 }

@@ -1,6 +1,6 @@
 # Trao Interview Prep
 
-Current implementation: account registration/login, MongoDB-backed server sessions, a protected dashboard, job-description/company URL/day input, private history, background research and kit generation, and a structured kit viewer.
+Current implementation: account registration/login, MongoDB-backed server sessions, a protected dashboard, single and Excel workbook batch job-description/company input, private history, background research and kit generation, an editable kit builder, and flashcard practice.
 
 ## Stack
 
@@ -20,6 +20,18 @@ Current implementation: account registration/login, MongoDB-backed server sessio
 
 The API runs at http://localhost:4000. Register using full name, email and password. A user's history is always queried with their authenticated user id.
 
+## Public deployment (Vercel + Render + MongoDB Atlas)
+
+The web app is a Next.js workspace and the API is a long-running Express server. Deploy the web workspace to Vercel and the API workspace as a Render Web Service; use MongoDB Atlas for both kit data and MongoDB-backed sessions. This avoids adapting the Express API and its in-process generation flow to a serverless runtime.
+
+1. Create an Atlas database user and database, then copy the Node.js connection URI. Add the deployment host's outbound IPs to the Atlas IP access list. Use a least-privilege database user and keep the URI private.
+2. Create a Render Web Service from the repository root. Build with `npm ci && npm run build --workspace @trao/api`; start with `npm run start --workspace @trao/api`; set health check path to `/api/health`.
+3. Add these API service variables in Render: `NODE_ENV=production`, `MONGODB_URI`, a unique random `SESSION_SECRET` (at least 32 characters), `GROQ_API_KEY`, `GROQ_MODEL=openai/gpt-oss-20b`, `TAVILY_API_KEY`, and `WEB_ORIGIN` set to the Vercel production origin (for example, `https://trao-prep.vercel.app`). Render supplies `PORT`.
+4. Create a Vercel project from the same repository with Root Directory `apps/web` and the Next.js framework preset. Add `NEXT_PUBLIC_API_URL=/api` and `API_PROXY_TARGET` set to the Render API origin only (for example, `https://trao-api.onrender.com`, without `/api`). The Next.js rewrite proxies `/api/*` to the Express service so browser requests and the HttpOnly session cookie stay on the frontend origin.
+5. Deploy both services, then open the Vercel URL and verify `/api/health` through the frontend domain, registration/login, creating a kit, and revisiting history after signing out and back in.
+
+Render's free web services spin down after 15 minutes without inbound traffic and can take about a minute to wake. That can make the first request slow and makes long background generations vulnerable if the UI stops polling; use an always-on instance for a more reliable public demo. Keep all secrets in provider environment settings, never in Git.
+
 ### Run the batch evaluator
 
 Create a UTF-8 JSON file containing an array of cases. Each case has a unique caller-provided `id`, pasted `jd`, `company_url`, and integer `days` from 1 to 60. Then run this exact assessment entry point from the repository root:
@@ -29,6 +41,8 @@ npm run evaluate -- --input ./cases.json --output ./kits.json
 ```
 
 The evaluator loads the same root `.env` as the API and calls the same `generateKit` pipeline, including retrieval, generation, retry/backoff, deterministic coverage repair, schedule allocation, and Zod structure validation. It processes cases sequentially to share the process-wide Groq token gate and reduce bursts against free-tier rate limits. Progress is written to stderr; the output file contains one result for every input case and stays valid when individual cases fail. Invalid cases are recorded as `failed` with `INVALID_CASE`; pipeline failures include a structured error code/message. A partially researched but generated kit remains `ok`, with retrieval gaps in the `kit.source_gaps` extension. The command writes `{ "version": "1.0", "generated_at": "<ISO timestamp>", "kits": [...] }` and continues after case failures.
+
+The dashboard batch uploader accepts an Excel `.xlsx` workbook with one role per row. Its `Roles` worksheet uses `Role title`, `Company website`, `Job description`, and optional `Days until interview (optional)` columns. Long and multi-line descriptions can be pasted into one cell. Blank rows are ignored, each non-empty row is validated and previewed before submission, and optional day values fall back to the dashboard's default-day setting. Uploads support up to 10 roles and 5 MB. Download the user template at `apps/web/public/batch-template.xlsx`. This UI file format is separate from the JSON format required by the evaluator CLI above.
 
 Example input:
 
@@ -50,17 +64,18 @@ Example input:
 - Session IDs are regenerated on successful login and registration, and invalidated on logout.
 - Protected API routes reject missing sessions. The frontend returns signed-out users to the login screen.
 - The dashboard saves a job title, company website, pasted job description and 1–60 day preparation window, then starts generation in the background.
+- Users can also upload an Excel workbook with up to 10 job description/company pairs; each row creates a separate private kit and may specify its own preparation days.
 - History shows generation progress and failures. A ready kit includes the company brief, role requirements, questions, flashcards, schedule, deterministic coverage result, and research gaps.
 
 ## Assessment implementation plan
 
 1. **Foundation and authentication (current):** app skeleton, registration/login/logout, sessions, protected dashboard shell, per-user history.
-2. **Kit input and persistence (in progress):** validate job description, company URL and days; persist a private draft. Generation state and progress are next.
+2. **Kit input and persistence (implemented):** validate job description, company URL and days; persist private drafts; upload up to 10 role/company pairs from an Excel workbook; show generation state and progress.
 3. **Research and first generation slice (implemented):** bounded company-site crawl, ranked same-site links, robots.txt checks, optional public interview-discussion search, progress, and source-gap recording.
 4. **Structured generation (implemented):** separate role extraction, company brief, and question-category calls; Zod kit validation; flashcards; and an Appendix A shape.
 5. **Deterministic quality loop (implemented):** code checks requirement links, generates a second pass for gaps, closes remaining must-have gaps with a transparent deterministic prompt/outline, and allocates integer-minute study days with must-have/harder topics earlier.
 6. **Builder and practice (implemented):** inline edits, reorder/add/delete, safe section regeneration, flashcard practice, saved confidence and weakest-first sessions.
-7. **Batch evaluator (implemented) and finish:** exact `npm run evaluate -- --input <cases.json> --output <kits.json>`; targeted schedule/coverage/schema tests, deployment and walkthrough remain.
+7. **Batch evaluator and targeted quality tests (implemented):** exact `npm run evaluate -- --input <cases.json> --output <kits.json>`; schedule allocation, coverage checking, and Appendix A validation have focused automated tests. Public deployment and walkthrough remain.
 
 Protect the exact Appendix A names and Appendix B batch command early because the evaluator depends on them. Keep the fourth day as submission slack; the optional feature comes after required behavior.
 
@@ -143,4 +158,4 @@ Use an opaque, server-side session stored in MongoDB. It is straightforward to r
 
 ## Current tests
 
-Run `npm test` for API validation and auth behavior checks. Full browser/database end-to-end coverage will be expanded alongside the remaining application slices.
+Run `npm test` for API tests, including schedule allocation (exact day count, integer durations, question assignment and priority ordering), requirement coverage checking, Appendix A kit structure and cross-reference validation, research behavior, rate limiting, and auth behavior. Full browser/database end-to-end coverage remains outside this focused suite.

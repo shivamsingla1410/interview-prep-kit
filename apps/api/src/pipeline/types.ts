@@ -27,6 +27,26 @@ export const kitSchema = z.object({
   flashcards: z.array(flashcardSchema),
   schedule: z.object({ days_available: z.number().int().min(1).max(60), days: z.array(z.object({ day: z.number().int(), focus: z.string(), question_ids: z.array(z.string()), minutes: z.number().int() })) }),
   coverage: z.object({ uncovered_requirement_ids: z.array(z.string()), passes: z.number().int().min(1) }),
+}).superRefine((kit, context) => {
+  const requirementIds = new Set(kit.role.requirements.map((requirement) => requirement.id));
+  const questionIds = new Set(kit.questions.map((question) => question.id));
+  if (kit.schedule.days.length !== kit.schedule.days_available) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['schedule', 'days'], message: 'Schedule must contain exactly days_available entries.' });
+  }
+  kit.schedule.days.forEach((day, index) => {
+    if (day.day !== index + 1) context.addIssue({ code: z.ZodIssueCode.custom, path: ['schedule', 'days', index, 'day'], message: 'Schedule days must be numbered consecutively from 1.' });
+    day.question_ids.forEach((id, questionIndex) => {
+      if (!questionIds.has(id)) context.addIssue({ code: z.ZodIssueCode.custom, path: ['schedule', 'days', index, 'question_ids', questionIndex], message: `Schedule references unknown question id: ${id}.` });
+    });
+  });
+  kit.questions.forEach((question, questionIndex) => {
+    question.requirement_ids.forEach((id, requirementIndex) => {
+      if (!requirementIds.has(id)) context.addIssue({ code: z.ZodIssueCode.custom, path: ['questions', questionIndex, 'requirement_ids', requirementIndex], message: `Question references unknown requirement id: ${id}.` });
+    });
+  });
+  kit.coverage.uncovered_requirement_ids.forEach((id, index) => {
+    if (!requirementIds.has(id)) context.addIssue({ code: z.ZodIssueCode.custom, path: ['coverage', 'uncovered_requirement_ids', index], message: `Coverage references unknown requirement id: ${id}.` });
+  });
 });
 export type Requirement = z.infer<typeof requirementSchema>;
 export type Question = z.infer<typeof questionSchema>;
